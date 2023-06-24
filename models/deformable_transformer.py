@@ -127,6 +127,18 @@ class DeformableTransformer(nn.Module):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
+        """
+            created by ningyuguang.
+            为encoder层的输入做准备
+            1.将各特征图层(已经映射到256维)flatten并concat到一起:(bs, h_lvl1*w_lvl1+hlvl2*w_lvl2+...,c=256)
+            2.将各特征图层的mask(指示了哪些位置是padding)flatten并concat：(bs,h_lvl1*w_lvl1+h_lvl2*w_lvl2+...)
+            3.将各特征图层对应的position embedding 加上scale level embedding(用于表明query属于哪个特征层)，然后flatten并concat：
+            (bs, h_lvl1*w_lvl1+h_lvl2*w_lvl2+...,c=256)
+            4.将各特征图的宽高list变为tensor:(n_lvl, 2)
+            5.由于将所有特征层的特征点concat一起，为了区分各层，需要计算对应于被flatten的那个维度的起始index(第一层是0)
+            6.计算各特征层中非podding部分的边长(宽高)占特征图变长的比例
+            问题:srcs、mask、position 是怎么来的？5、6的作用又是什么？
+        """
         src_flatten = []
         mask_flatten = []
         lvl_pos_embed_flatten = []
@@ -146,6 +158,7 @@ class DeformableTransformer(nn.Module):
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
+        # tensor([    0,  8056, 10070, 10583], device='cuda:0')
         level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
@@ -250,7 +263,13 @@ class DeformableTransformerEncoder(nn.Module):
         return reference_points
 
     def forward(self, src, spatial_shapes, level_start_index, valid_ratios, pos=None, padding_mask=None):
+        # 这里的pos是position embedding + scala-level embedding
         output = src
+        """
+            将各特征点在其所在特征层归一化坐标映射到所有特征层，使得每个特征点在所有特征层上都会得到一个归一化的坐标
+            这个reference_points相当于key的角色，从而每个query都会和其在所有特征层的位置(也就是以下计算出来的坐标)进行交互
+            实现了跨尺度融合效果，因此不需要FPN
+        """
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         for _, layer in enumerate(self.layers):
             output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask)

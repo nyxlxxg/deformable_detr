@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.nn.init import xavier_uniform_, constant_
 
 from ..functions import MSDeformAttnFunction
+from models.ops.functions.ms_deform_attn_func import ms_deform_attn_core_pytorch
 
 
 def _is_power_of_2(n):
@@ -52,9 +53,14 @@ class MSDeformAttn(nn.Module):
         self.n_heads = n_heads
         self.n_points = n_points
 
+        # 采样点的坐标偏移，每个query在每个注意力头和每个特征层都需要采样n_points个.
+        # 由于x\y坐标都有对应的偏移量，因此要*2
         self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
+        # 每个query对应的所有采样点的注意力权重
         self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
+        # 线性变换得到value
         self.value_proj = nn.Linear(d_model, d_model)
+        # 最后经过线性变换得到输出结果
         self.output_proj = nn.Linear(d_model, d_model)
 
         self._reset_parameters()
@@ -109,7 +115,8 @@ class MSDeformAttn(nn.Module):
         else:
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
-        output = MSDeformAttnFunction.apply(
-            value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+        # output = MSDeformAttnFunction.apply(
+        #     value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+        output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
         output = self.output_proj(output)
         return output

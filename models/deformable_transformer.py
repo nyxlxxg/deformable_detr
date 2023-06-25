@@ -157,6 +157,7 @@ class DeformableTransformer(nn.Module):
         src_flatten = torch.cat(src_flatten, 1)
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+        # (n_lvl, 2)
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
         # tensor([    0,  8056, 10070, 10583], device='cuda:0')
         level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
@@ -166,20 +167,46 @@ class DeformableTransformer(nn.Module):
         memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
 
         # prepare input for decoder
+        '''处理encoder输出，为decoder输入做准备'''
         bs, _, c = memory.shape
         if self.two_stage:
+            """
+            1.生成proposals,并且对Encoder的输出(memory)进行处理(全连接层+层归一化)
+            2.(bs, h_lvl1*w_lvl1+h_lvl2*w_lvl2+...,256),(bs, h_lvl1*w_lvl1+h_lvl2*w_lvl2+...,4)
+            3.其中proposals每个都是xywh形式，并且是经过inverse-sigmoid函数后的结果.
+            4.(其实这里的output_proposals对应的就是各层特征图各个特征点的位置(相当于anchor形式，是固定的),
+            5.因此还需要借助Decoder最后一层的bbox head来预测一个偏移(offset)来得到一个更加灵活的结果.
+            6.这才是第一阶段预测的proposal boxes)
+            """
             output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
 
             # hack implementation for two-stage Deformable DETR
+            # 注意这里的维度是多分类,并非二分类
             enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
+            # bbox head预测的是相对proposals的偏移,因此这里要相加，后续还要经过sigmoid函数才能得到真正的bbox预测结果(归一化)
             enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
 
+            # 300
             topk = self.two_stage_num_proposals
+            # 选取得分最高的topk分类预测，最后的[1]代表取得返回topk对应的索引
+            # TODO: 取第一个类别的预测结果算top-k，代表二分类
             topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
+            # 拿出topk得分最高对应得预测bbox:(bs, k=300, 4)
             topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
+            # 注意这里取消了梯度
             topk_coords_unact = topk_coords_unact.detach()
+            # 经过了sigmoid，变成归一化的形式，这个结果会送到Decoder中作为初始的bboxes估计
             reference_points = topk_coords_unact.sigmoid()
             init_reference_out = reference_points
+            # TODO: query embedding 的作用到底是什么？
+            """
+            生成decoder的query(target)和query embedding;
+            对top-k proposal boxes进行位置编码，编码方式是给xywh每个都赋予128维,
+            其中每128维中，偶数维度用sin函数，奇数维度用cos函数编码;
+            然后经过全连接层和层归一化处理;
+            最终，前256维结果(对应xy位置)作为decoder得query embedding(因为xy代表的是位置信息)
+            后256维结果(对应wh)作为target(query)
+            """
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
             query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
         else:

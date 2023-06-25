@@ -41,11 +41,22 @@ class MSDeformAttnFunction(Function):
 def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations, attention_weights):
     # for debug and test only,
     # need to use cuda version instead
+    """
+    :param value: 根据input_flatten 变换出的value
+    :param value_spatial_shapes: 每一层采样的宽高
+    :param sampling_locations: 采样点的坐标
+    :param attention_weights: attention权重
+    :return:
+    """
     N_, S_, M_, D_ = value.shape
     _, Lq_, M_, L_, P_, _ = sampling_locations.shape
+    # 分割得到各特征层对应的value，是一个list
     value_list = value.split([H_ * W_ for H_, W_ in value_spatial_shapes], dim=1)
+    # 由于以下使用了F.grid_sample(),要求采样位置的坐标是归一化到[-1,1]范围((-1,-1))代表左上角;（1,1）代表右下角)
+    # 因此这里是将[0,1]映射到[-1,1]
     sampling_grids = 2 * sampling_locations - 1
     sampling_value_list = []
+    '''基于采样点位置插值出对应的采样特征'''
     for lid_, (H_, W_) in enumerate(value_spatial_shapes):
         # N_, H_*W_, M_, D_ -> N_, H_*W_, M_*D_ -> N_, M_*D_, H_*W_ -> N_*M_, D_, H_, W_
         value_l_ = value_list[lid_].flatten(2).transpose(1, 2).reshape(N_*M_, D_, H_, W_)

@@ -93,20 +93,44 @@ class MSDeformAttn(nn.Module):
 
         :return output                     (N, Length_{query}, C)
         """
+
+        """
+        1.将输入input_flatten(对于Encoder就是由backbone输出的特征图变换而来；对于decoder就是Encoder输出的memory)
+        通过变换矩阵得到value，同时将padding的部分用0填充.
+        2.将query(对于Encoder就是特征图本身加上position&scale-level embedding; 对于decoder就是self-attention的输出加上position embedding结果，
+        2-stage时这个position embedding是有Encoder预测的top-k proposal boxes进行positon embedding得来；而1-stage是预设的embedding)分别通过两个
+        全连接层得到采样点对应的坐标偏移和注意力权重(注意力权重会进行归一化).
+        3.根据参考点(reference points:对于Decoder来说，2-stage时时Encoder预测的top-k proposal boxes;1-stage时是由预设的query embedding经过全连接
+        层得到。两种情况下最终都经过了sigmoid函数归一化; 对于Encoder来说，就是各特征点在所有特征层对应的归一化中心坐标)坐标和预测坐标偏移得到采样点坐标.
+        4.由采样点坐标在value中插值采样出对应的特征向量，然后施加注意力权重，最后将这个结果经过全链接层得到输出结果
+        """
+
         N, Len_q, _ = query.shape
         N, Len_in, _ = input_flatten.shape
+        # 这个值需要是所有特征层特征点的数量
+        # input_spatial_shapes 每一层的高宽
         assert (input_spatial_shapes[:, 0] * input_spatial_shapes[:, 1]).sum() == Len_in
 
+        # (N, Len_in, d_model=256)
         value = self.value_proj(input_flatten)
         if input_padding_mask is not None:
+            # 将原图padding的部分用0填充
             value = value.masked_fill(input_padding_mask[..., None], float(0))
+        # (N, Len_in, 8, 32) 拆分成8个注意力头部对应的维度
         value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
+        # (N, Len_in, 8, 4, 4, 2)预测采样点的坐标偏移
         sampling_offsets = self.sampling_offsets(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
+        # (N, Len_in, 8, 4*4) 预测采样点对应的注意力权重
         attention_weights = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
+        # (N, Len_in, 8, 4, 4) 每个query在每个注意力头部内，每个特征层都采样里个特征点,即16(4*4)个采样，这16个对应的权重进行归一化
         attention_weights = F.softmax(attention_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
+        '''计算采样点的坐标(以下参考点的坐标已归一化)'''
         # N, Len_q, n_heads, n_levels, n_points, 2
         if reference_points.shape[-1] == 2:
+            # (4,2)其中每个是(w, h)
             offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
+            # (N, Len_q, 1, n_levels=4,1,2) + (N, Len_q, 8, n_levels=4,4,2)/(1,1,1,n_levels=4,1,2)
+            # 对坐标偏移量使用对应层特征图的宽高进行归一化，然后家在参考点的坐标上得到采样点的坐标
             sampling_locations = reference_points[:, :, None, :, None, :] \
                                  + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
         elif reference_points.shape[-1] == 4:
